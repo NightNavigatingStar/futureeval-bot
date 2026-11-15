@@ -80,12 +80,24 @@ Repository secrets, never committed:
 
 Local runs read the same names from `.env` (see `.env.template`).
 
+## One forecast per question
+
+Bot-only tournaments ask for a single forecast per question, so re-runs must not
+re-submit. `MetaculusQuestion.already_forecasted` cannot be used for that here: the
+series list payload carries no `my_forecasts`, and asking per question costs one HTTP
+request each, which trips Metaculus' rate limiter at ~85 questions.
+
+`bot_state.py` records question ids after each batch into `state/forecasted.json`, and
+the workflow commits that file back so it survives ephemeral runners. If the file is
+lost, `python seed_state.py minibench` rebuilds it from the server.
+
 ## Running locally
 
 ```bash
 pip install -r requirements.txt
-python smoke.py   # dry run on one question, publishes nothing
-python main.py    # real run: forecast + publish
+python smoke.py            # dry run on one question, publishes nothing
+python main.py             # real run: forecast + publish
+python seed_state.py       # rebuild state/forecasted.json from the server
 ```
 
 `run_bot.cmd` is the Windows wrapper used by a local Task Scheduler entry; it clears
