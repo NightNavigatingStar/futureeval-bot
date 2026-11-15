@@ -1,7 +1,10 @@
 # Pinned to the exact versions verified locally on 2026-11-16.
 # forecasting-tools 0.3.7 is the version whose MetaculusClient method names
-# (get_all_open_questions_from_tournament etc.) the bot code is written against.
+# (get_all_open_questions_from_tournament, get_question_by_post_id) the bot code
+# is written against. litellm is transitive but pinned so a silent major bump
+# cannot change how deepseek/deepseek-chat is called.
 forecasting-tools==0.3.7
+litellm==1.106.10
 openai==2.54.0
 python-dotenv==1.2.4
 numpy==2.5.4

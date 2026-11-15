@@ -20,15 +20,34 @@ the model wiring, the run cadence, and the environment checks.
 |---|---|---|
 | `default` (forecasting reasoning) | `deepseek/deepseek-chat` | temperature 0.3 |
 | `parser` (prose -> structured prediction) | `deepseek/deepseek-chat` | temperature 0 |
-| `researcher` | `deepseek/deepseek-chat` | no search provider configured yet |
+| `researcher` | `deepseek/deepseek-chat` | reads web excerpts, see below |
 | `summarizer` | `deepseek/deepseek-chat` | temperature 0 |
 
 Pinned in `bot_llms.py` rather than left to defaults, so the bot cannot silently fall
 back to a provider whose key is not present.
 
-Known limitation: `researcher` is a plain LLM call with no web access, so "research"
-is the model's own knowledge. Adding a search API (AskNews / Exa / Perplexity) is the
-obvious next improvement.
+## Web research
+
+`bot_research.py` gives the researcher something to read. The researcher LLM first
+turns the question into two short keyword queries (~5 words; a full question sentence
+returns dictionary entries), then `bot_research.py` searches, scrapes the top pages,
+strips them to text, and hands the excerpts over as cited blocks. No paid search API is
+configured: DuckDuckGo's HTML endpoint is tried first (works from CI, blocked in mainland
+China), then Bing, with a per-process circuit breaker so an unreachable provider is not
+re-tried for every question.
+
+Spend is routed by how far away the question resolves, measured on 86 open MiniBench
+questions on 2026-11-16:
+
+| Horizon | Questions | Research |
+|---|---|---|
+| ≤ 60 days | 43 | 2 queries, 3 pages |
+| 60–180 days | 3 | 1 query, 2 pages |
+| > 180 days | 40 | none — base rates only |
+
+The long-horizon cut is deliberate: questions like "how many US states in 2050?" have no
+reporting that changes the answer, so scraping there buys noise at the cost of time.
+Set `WEB_RESEARCH=0` to disable research entirely and get the LLM-only baseline.
 
 ## Cadence
 
@@ -38,6 +57,19 @@ Why hourly: of the 152 questions in this tournament, 151 had an open window of e
 3.0 hours. The constraint is therefore "one successful run per 3-hour window" — hourly
 gives three attempts per window, which absorbs a transient failure without spending a
 run every 20 minutes.
+
+## MiniBench needs a different loader
+
+MiniBench is registered as a *question series*, not a tournament, so the SDK's
+`get_all_open_questions_from_tournament("minibench")` returns **zero** questions even
+when the series is open. `bot_tournaments.py` pages
+`/api/posts/?question_series=minibench` instead and parses each post with the SDK's own
+`DataOrganizer.get_question_from_post_json`.
+
+It deliberately does not call `get_question_by_post_id()` per question: that is one HTTP
+request each, and ~40 of them tripped Metaculus' rate limiter (HTTP 429 / Cloudflare
+1015) even at four workers, after which the SDK's retry backoff cost more time than the
+forecasts themselves.
 
 ## Secrets
 

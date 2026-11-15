@@ -1,6 +1,9 @@
 import argparse
 import asyncio
+import json
 import logging
+import os
+import re
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -14,8 +17,32 @@ from bot_helpers import (
     silence_noisy_dependencies,
 )
 from bot_llms import deepseek_llms
+from bot_research import gather_research
+from bot_tournaments import load_open_questions_from_series
 
 silence_noisy_dependencies()
+
+# Web research is free but not always reachable (mainland China networks block
+# DuckDuckGo; CI runners do not). READ_FROM_WEB=0 gives the LLM-only baseline.
+WEB_RESEARCH_ENABLED = os.getenv("WEB_RESEARCH", "1") != "0"
+
+# Research spend is routed by how far away the question resolves. Measured on
+# 400 historical MiniBench questions: 22/39 open ones resolve within 60 days and
+# reward fresh reporting, while 16/39 sit beyond 200 days (some to 2050) where no
+# article changes the answer and search only adds noise. Retrieval on those costs
+# time and money for nothing, so they fall back to base rates.
+SHORT_HORIZON_DAYS = int(os.getenv("SHORT_HORIZON_DAYS", "60"))
+LONG_HORIZON_DAYS = int(os.getenv("LONG_HORIZON_DAYS", "180"))
+
+
+WEB_SOURCE_BLOCK = """
+
+Below are excerpts from recently retrieved web pages. They are machine-extracted
+and may be truncated, stale, or about a neighbouring topic. Use them only where
+they bear on the resolution criteria above, and say so when they are unusable.
+
+{web_sources}
+"""
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -44,6 +71,21 @@ from forecasting_tools import (
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+def research_budget(question: MetaculusQuestion) -> tuple[int, int]:
+    """Return (max_search_queries, max_pages) for this question's horizon."""
+    close_time = getattr(question, "close_time", None)
+    if close_time is None:
+        return 1, 2  # unknown horizon: one cheap look, then decide
+    if close_time.tzinfo is None:
+        close_time = close_time.replace(tzinfo=timezone.utc)
+    days = (close_time - datetime.now(timezone.utc)).days
+    if days <= SHORT_HORIZON_DAYS:
+        return 2, 3
+    if days <= LONG_HORIZON_DAYS:
+        return 1, 2
+    return 0, 0
 
 
 class FallTemplateBot2026(ForecastBot):
@@ -121,9 +163,9 @@ class FallTemplateBot2026(ForecastBot):
     Additionally OpenRouter has large rate limits immediately on account creation
     """
 
-    _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
+    _max_concurrent_questions = int(
+        os.getenv("MAX_CONCURRENT_QUESTIONS", "3")
+    )  # Set this to whatever works for your search-provider/ai-model rate limits
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
@@ -134,7 +176,26 @@ class FallTemplateBot2026(ForecastBot):
             research = ""
             researcher = self.get_llm("researcher")
 
+            web_sources = ""
+            max_queries, max_pages = research_budget(question)
+            if WEB_RESEARCH_ENABLED and max_pages > 0:
+                try:
+                    queries = (await self._build_search_queries(question))[:max_queries]
+                    # Blocking HTTP in a worker thread so one slow page cannot
+                    # stall the event loop for the other questions in the batch.
+                    web_sources = await asyncio.to_thread(
+                        gather_research, queries, max_pages
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Web research unavailable: %s", exc)
+            elif max_pages == 0:
+                logger.info(
+                    "Skipping web research: horizon beyond %sd", LONG_HORIZON_DAYS
+                )
+
             prompt = self._get_research_prompt(question, researcher)
+            if web_sources:
+                prompt += WEB_SOURCE_BLOCK.format(web_sources=web_sources)
 
             if isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(prompt)
@@ -165,6 +226,48 @@ class FallTemplateBot2026(ForecastBot):
             return research
 
     @staticmethod
+    def _keyword_fallback(question_text: str) -> list[str]:
+        """Crude query if the LLM refuses to emit JSON: drop lead-in words."""
+        words = re.sub(r"[^\w\s'-]", " ", question_text).split()
+        stop = {
+            "will", "would", "the", "a", "an", "any", "be", "is", "are", "was",
+            "were", "how", "many", "much", "what", "which", "who", "before",
+            "after", "by", "in", "on", "of", "to", "for", "and", "or", "than",
+        }
+        kept = [w for w in words if w.lower() not in stop]
+        return [" ".join(kept[:8])] if kept else []
+
+    async def _build_search_queries(self, question: MetaculusQuestion) -> list[str]:
+        """Ask the LLM for short keyword queries.
+
+        Feeding a full question sentence to a search engine returns dictionary
+        entries for common words, which is how the first version failed.
+        """
+        prompt = clean_indents(
+            f"""
+            Write two short web search queries that would surface factual
+            reporting relevant to this forecasting question. Each query must be
+            2-6 words, keyword style, no question marks, no site: operators.
+
+            Reply with a JSON array of two strings and nothing else.
+
+            Question: {question.question_text}
+            Resolution criteria: {question.resolution_criteria}
+            """
+        )
+        try:
+            raw = await self.get_llm("summarizer", "llm").invoke(prompt)
+            match = re.search(r"\[[\s\S]*?\]", raw)
+            if match:
+                queries = [q.strip() for q in json.loads(match.group(0))]
+                queries = [q for q in queries if isinstance(q, str) and q][:2]
+                if queries:
+                    return queries
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Query generation failed, falling back: %s", exc)
+        return self._keyword_fallback(question.question_text)
+
+    @staticmethod
     def _get_research_prompt(
         question: MetaculusQuestion, researcher: str | GeneralLlm
     ) -> str:
@@ -177,6 +280,16 @@ class FallTemplateBot2026(ForecastBot):
             The superforecaster will give you a question they intend to forecast on.
             To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
             You do not produce forecasts yourself.
+
+            Structure your answer in two parts.
+
+            Part 1 -- outside view. Name the reference class this question belongs to
+            (the population of similar questions) and state its historical base rate.
+            Be concrete about which class you chose and why; a base rate with no class
+            behind it is worse than none.
+
+            Part 2 -- inside view. The news rundown: what has already happened, what is
+            scheduled before the resolution date, and which facts would move the answer.
 
             Question:
             {question.question_text}
@@ -710,7 +823,13 @@ if __name__ == "__main__":
     # uncomment and edit to pin specific models.
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        # The upstream template uses 5 samples and medians them. Measured cost on
+        # deepseek-chat is ~0.015 CNY per sample with web research enabled, and a
+        # MiniBench round can open 80+ questions, so 3 samples keeps a full round
+        # inside a few yuan while still giving the aggregator something to median.
+        predictions_per_research_report=int(
+            os.getenv("PREDICTIONS_PER_RESEARCH_REPORT", "3")
+        ),
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
@@ -740,8 +859,11 @@ if __name__ == "__main__":
             )
         )
         minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+            template_bot.forecast_questions(
+                load_open_questions_from_series(
+                    client.CURRENT_MINIBENCH_ID, client=client
+                ),
+                return_exceptions=True,
             )
         )
         forecast_reports = seasonal_tournament_reports + minibench_reports
