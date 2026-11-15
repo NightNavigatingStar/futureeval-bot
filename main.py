@@ -851,17 +851,33 @@ if __name__ == "__main__":
     # Dispatch on mode. Each branch produces a list of ForecastReport (or
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
+    # Per-run ceiling. MiniBench opened 86 questions in its first week, and at
+    # ~30s each a full sweep would sit close to the 55-minute job timeout. Capping
+    # keeps every run short; the next hourly run picks up whatever is left, since
+    # already-forecasted questions are skipped. 0 disables the cap.
+    MAX_QUESTIONS_PER_RUN = int(os.getenv("MAX_QUESTIONS_PER_RUN", "40"))
+
+    def cap(questions: list) -> list:
+        return questions[:MAX_QUESTIONS_PER_RUN] if MAX_QUESTIONS_PER_RUN > 0 else questions
+
     client = MetaculusClient()
     if run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+            template_bot.forecast_questions(
+                cap(
+                    client.get_all_open_questions_from_tournament(
+                        client.CURRENT_AI_COMPETITION_ID
+                    )
+                ),
+                return_exceptions=True,
             )
         )
         minibench_reports = asyncio.run(
             template_bot.forecast_questions(
-                load_open_questions_from_series(
-                    client.CURRENT_MINIBENCH_ID, client=client
+                cap(
+                    load_open_questions_from_series(
+                        client.CURRENT_MINIBENCH_ID, client=client
+                    )
                 ),
                 return_exceptions=True,
             )
