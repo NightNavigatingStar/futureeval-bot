@@ -28,6 +28,8 @@ import logging
 import requests
 from forecasting_tools import DataOrganizer, MetaculusClient, MetaculusQuestion
 
+from bot_state import already_forecasted
+
 logger = logging.getLogger(__name__)
 
 API_BASE = "https://www.metaculus.com/api/posts/"
@@ -77,17 +79,36 @@ def list_open_posts(series: str, max_pages: int = MAX_PAGES) -> list[dict]:
 
 
 def load_open_questions_from_series(
-    series: str, client: MetaculusClient | None = None
+    series: str,
+    client: MetaculusClient | None = None,
+    skip_forecasted: bool = True,
+    limit: int | None = None,
 ) -> list[MetaculusQuestion]:
-    """Return typed question objects for every open question in the series."""
-    del client  # kept for call-site compatibility; parsing needs no HTTP client
+    """Open questions in the series, minus the ones this bot already forecasted.
+
+    Everything is parsed from the list payload -- no per-question requests, see
+    the module docstring for why that matters. Deduplication therefore comes from
+    bot_state, not from `already_forecasted` (which the list payload never sets).
+    """
+    del client  # parsing from the list payload needs no HTTP client
+    done = already_forecasted(series) if skip_forecasted else set()
     questions: list[MetaculusQuestion] = []
     for post in list_open_posts(series):
+        if limit is not None and len(questions) >= limit:
+            break
         try:
-            questions.append(DataOrganizer.get_question_from_post_json(post))
+            question = DataOrganizer.get_question_from_post_json(post)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Skipping post %s: %s", post.get("id"), exc)
-    logger.info("Series %r: parsed %d questions", series, len(questions))
+            continue
+        if question is None:
+            continue
+        if skip_forecasted and int(question.id_of_question) in done:
+            continue
+        questions.append(question)
+    logger.info(
+        "Series %r: %d forecastable (%d already in state)", series, len(questions), len(done)
+    )
     return questions
 
 

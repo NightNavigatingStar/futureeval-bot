@@ -18,6 +18,7 @@ from bot_helpers import (
 )
 from bot_llms import deepseek_llms
 from bot_research import gather_research
+from bot_state import record_forecasted
 from bot_tournaments import load_open_questions_from_series
 
 silence_noisy_dependencies()
@@ -872,15 +873,23 @@ if __name__ == "__main__":
                 return_exceptions=True,
             )
         )
+        minibench_questions = cap(
+            load_open_questions_from_series(client.CURRENT_MINIBENCH_ID, client=client)
+        )
         minibench_reports = asyncio.run(
             template_bot.forecast_questions(
-                cap(
-                    load_open_questions_from_series(
-                        client.CURRENT_MINIBENCH_ID, client=client
-                    )
-                ),
-                return_exceptions=True,
+                minibench_questions, return_exceptions=True
             )
+        )
+        # Bot-only tournaments allow one forecast per question, so remember what
+        # went through; the next run filters these out for free.
+        record_forecasted(
+            str(client.CURRENT_MINIBENCH_ID),
+            [
+                int(report.question.id_of_question)
+                for report in minibench_reports
+                if not isinstance(report, BaseException)
+            ],
         )
         forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
