@@ -55,11 +55,26 @@ of LLM time per question.
 
 `bot_research.py` gives the researcher something to read. The researcher LLM first
 turns the question into two short keyword queries (~5 words; a full question sentence
-returns dictionary entries), then `bot_research.py` searches, scrapes the top pages,
-strips them to text, and hands the excerpts over as cited blocks. No paid search API is
-configured: DuckDuckGo's HTML endpoint is tried first (works from CI, blocked in mainland
-China), then Bing, with a per-process circuit breaker so an unreachable provider is not
-re-tried for every question.
+returns dictionary entries), then the text of the top pages is handed over as cited
+blocks.
+
+Two backends, in order:
+
+1. **DeepSeek's Search API** (`POST /v1/tools/search` with `need_content=true`). It
+   returns the page text itself, so nothing is scraped. Billed per successful request
+   at $0.75/1000, i.e. **~$0.0015 for a two-query question**.
+2. **Scraping DuckDuckGo's HTML endpoint, then Bing**, free, with a per-process
+   circuit breaker so a dead provider is not retried for every question.
+
+The ordering is not cosmetic. Measured from this machine on 2026-11-16: DuckDuckGo
+times out outright (blocked), and Bing redirects to `cn.bing.com` and returns pages
+unrelated to the query — an Ibovespa query came back with cricket scores, and the
+result links were `bing.com/ck/a` redirect URLs that scrape to nothing. Routing the
+same requests through a proxy got DuckDuckGo a 202 bot-challenge and Bing another set
+of irrelevant pages. The scraper therefore produces **empty research** from any
+mainland-China connection while looking healthy in the logs, which is exactly how a
+bot silently degrades to forecasting from parametric memory. The DeepSeek API is
+reachable from both networks, so it is the primary path.
 
 Spend is routed by how far away the question resolves, measured on 86 open MiniBench
 questions on 2026-11-16:

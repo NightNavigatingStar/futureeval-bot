@@ -9,9 +9,18 @@ significance, and two independent research sources beat either alone. The
 template bot has no research source at all -- its "researcher" is a bare LLM call
 with no web access, so every forecast comes from parametric memory.
 
-No paid search API is configured (AskNews/Exa/Perplexity need a key), so this
-module does the cheapest thing that still adds breadth: search, pull a few pages,
-strip them to text, and hand the excerpts to the researcher LLM.
+Two backends, tried in order
+----------------------------
+1. **DeepSeek's Search API** (`POST /v1/tools/search`, `need_content=true`). It
+   returns the page text itself, so no scraping is involved. Bills at $0.75 per
+   1000 successful requests -- about $0.0015 for a two-query question -- and runs
+   on api.deepseek.com, which is reachable from networks where DuckDuckGo is
+   blocked and where Bing serves bot-detection pages.
+2. **Scraping DuckDuckGo's HTML endpoint, then Bing.** Free, and it works from
+   GitHub's runners, but from a mainland-China connection DuckDuckGo times out and
+   Bing redirects to cn.bing.com and returns unrelated results (cricket scores for
+   an Ibovespa query, observed 2026-11-16). Kept as the fallback so the bot still
+   researches something when no DeepSeek key is present.
 
 Design constraints
 ------------------
@@ -29,6 +38,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -48,6 +58,8 @@ MAX_CHARS_PER_PAGE = 3500
 SEARCH_TIMEOUT = 8
 PAGE_TIMEOUT = 10
 TOTAL_BUDGET_SECONDS = 60
+DEEPSEEK_SEARCH_URL = "https://api.deepseek.com/v1/tools/search"
+DEEPSEEK_SEARCH_TIMEOUT = 30
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_RE = re.compile(r"<(script|style|noscript)[\s\S]*?</\1>", re.I)
@@ -151,6 +163,56 @@ def search(query: str, max_results: int = MAX_PAGES) -> list[dict]:
     return []
 
 
+def _deepseek_search(query: str, count: int) -> list[dict]:
+    """DeepSeek's own search index, with page text included.
+
+    Returns hits shaped like the scrapers' but carrying `text`, so the caller can
+    skip fetching. An empty list means "fall through to scraping".
+    """
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return []
+    try:
+        response = requests.post(
+            DEEPSEEK_SEARCH_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "count": max(count, 1), "need_content": True},
+            timeout=DEEPSEEK_SEARCH_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 - research must never break a forecast
+        logger.warning("DeepSeek search request failed for %r: %s", query, exc)
+        return []
+    if response.status_code != 200:
+        logger.warning(
+            "DeepSeek search returned %s for %r: %s",
+            response.status_code,
+            query,
+            response.text[:200],
+        )
+        return []
+    try:
+        results = response.json().get("results") or []
+    except ValueError:
+        return []
+
+    hits = []
+    for item in results:
+        text = (item.get("content") or item.get("summary") or "").strip()
+        if len(text) < 200:  # nothing to read, no point spending prompt on it
+            continue
+        hits.append(
+            {
+                "title": item.get("title") or "",
+                "url": item.get("url") or "",
+                "text": text[:MAX_CHARS_PER_PAGE],
+            }
+        )
+    return hits
+
+
 def fetch_text(url: str) -> str:
     """Fetch a page and reduce it to plain text. '' on any failure."""
     response = _get(url, timeout=PAGE_TIMEOUT)
@@ -161,11 +223,36 @@ def fetch_text(url: str) -> str:
     return _clean_html(response.text)[:MAX_CHARS_PER_PAGE]
 
 
+def _format_block(title: str, url: str, text: str) -> str:
+    return f"[{title}]\nURL: {url}\n{text}"
+
+
 def gather_research(queries: list[str], max_pages: int = MAX_PAGES) -> str:
-    """Search the given queries, scrape the best pages, format for the prompt."""
+    """Search the given queries, gather page text, format it for the prompt.
+
+    DeepSeek's search API is tried first because it needs no scraping and works
+    behind the GFW. Scraping is the fallback, not the plan.
+    """
     started = time.time()
-    hits: list[dict] = []
+
+    blocks: list[str] = []
     seen: set[str] = set()
+    for query in queries:
+        for hit in _deepseek_search(query, max_pages):
+            if hit["url"] in seen:
+                continue
+            seen.add(hit["url"])
+            blocks.append(_format_block(hit["title"], hit["url"], hit["text"]))
+            if len(blocks) >= max_pages:
+                break
+        if len(blocks) >= max_pages or time.time() - started > TOTAL_BUDGET_SECONDS:
+            break
+    if blocks:
+        logger.info("DeepSeek search: %d pages for %d queries", len(blocks), len(queries))
+        return "\n\n---\n\n".join(blocks)
+    logger.info("DeepSeek search gave nothing; falling back to scraping")
+
+    hits: list[dict] = []
     for query in queries:
         for hit in search(query, max_results=max_pages):
             if hit["url"] in seen:
@@ -189,7 +276,7 @@ def gather_research(queries: list[str], max_pages: int = MAX_PAGES) -> str:
             break
         if len(text) < 200:  # paywall, JS shell, or blocked
             continue
-        blocks.append(f"[{hit['title']}]\nURL: {hit['url']}\n{text}")
+        blocks.append(_format_block(hit["title"], hit["url"], text))
 
     if not blocks:
         return ""
