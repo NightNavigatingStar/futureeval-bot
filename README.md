@@ -18,13 +18,38 @@ the model wiring, the run cadence, and the environment checks.
 
 | Role | Model | Notes |
 |---|---|---|
-| `default` (forecasting reasoning) | `deepseek/deepseek-chat` | temperature 0.3 |
-| `parser` (prose -> structured prediction) | `deepseek/deepseek-chat` | temperature 0 |
-| `researcher` | `deepseek/deepseek-chat` | reads web excerpts, see below |
-| `summarizer` | `deepseek/deepseek-chat` | temperature 0 |
+| `default` (forecasting reasoning) | `deepseek/deepseek-flash` | temperature 0.3 |
+| `parser` (prose -> structured prediction) | `deepseek/deepseek-flash` | temperature 0 |
+| `researcher` | `deepseek/deepseek-flash` | reads web excerpts, see below |
+| `summarizer` | `deepseek/deepseek-flash` | temperature 0 |
 
 Pinned in `bot_llms.py` rather than left to defaults, so the bot cannot silently fall
-back to a provider whose key is not present.
+back to a provider whose key is not present. Override with `DEEPSEEK_MODEL`.
+
+### Why `deepseek-flash`, and why thinking is off
+
+`deepseek-flash` is DeepSeek-V4.1-Flash: $0.15/M input, $0.60/M output off-peak
+($0.30/$1.20 at peak hours), roughly a quarter of `deepseek-v4-pro` per token. The
+legacy `deepseek-chat` name still routes but is no longer listed in the provider's
+model catalogue.
+
+Thinking mode is **disabled** (`extra_body={"thinking": {"type": "disabled"}}`), for two
+reasons specific to this bot:
+
+1. **It would make aggregation meaningless.** DeepSeek documents that thinking mode
+   ignores `temperature`, and this bot aggregates `predictions_per_research_report=3`
+   runs that are only diverse because they sample at different temperatures. With
+   thinking on, the three reports converge on the same answer.
+2. **Reasoning tokens bill as output** and, at the default `high` effort, outweigh the
+   visible answer across ~12 calls per question.
+
+Set `DEEPSEEK_THINKING=enabled` (and `DEEPSEEK_EFFORT=low|high|max`) to flip it.
+
+Measured on 3 questions (binary / numeric / date) on 2026-11-16 with research
+scraping returning nothing: 12 calls and 66.5k prompt tokens (30% served from
+DeepSeek's automatic prefix cache) and 10.5k completion tokens per question, i.e.
+**$0.0089/question at peak, $0.0045 off-peak (≈ ¥0.06 / ¥0.03)**, and under 10 seconds
+of LLM time per question.
 
 ## Web research
 

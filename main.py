@@ -825,9 +825,9 @@ if __name__ == "__main__":
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
         # The upstream template uses 5 samples and medians them. Measured cost on
-        # deepseek-chat is ~0.015 CNY per sample with web research enabled, and a
+        # deepseek-flash is ~0.02 CNY per sample with web research enabled, and a
         # MiniBench round can open 80+ questions, so 3 samples keeps a full round
-        # inside a few yuan while still giving the aggregator something to median.
+        # inside a couple of yuan while still giving the aggregator something to median.
         predictions_per_research_report=int(
             os.getenv("PREDICTIONS_PER_RESEARCH_REPORT", "3")
         ),
